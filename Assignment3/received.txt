@@ -1,0 +1,13 @@
+5. If the file is present, the server reads the contents of the file and sends it to the client.
+Since the file can be arbitrarily long, the server cannot send the entire file in a single
+send() call, and sends the file in small chunks using multiple send() calls until the entire
+file is transferred. The chunk size used by the server is not known to the client. The
+server closes the connection after sending the entire file.
+6. The client reads the file contents sent by the server and copies it into a new file in the
+current directory. The client also maintains a running count of the number of bytes and
+the number of words in the file. For the purpose of this assignment, you can take ‘,’
+(comma), ‘;’ (semicolon), ‘:’ (colon), ‘.’ (fullstop), or one or more whitespace (space/tab),
+or any combinations of them, as delimiters between two words. For example, “this is”,
+“this is”, “this,is”, “this, is”, “this,, ; is” are all to be taken as 2 words).
+7. After the entire file is transferred, the client prints a message “The file transfer is
+successful. Size of the file = X bytes, no. of words.
