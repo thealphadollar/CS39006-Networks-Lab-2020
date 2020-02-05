@@ -1,5 +1,0 @@
-Stream Socket created.
-Stream Socket bound.
-Datagram socket bound.
-requested domain is localhost
-Sending hostname localhost to client...

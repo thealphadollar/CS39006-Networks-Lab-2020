@@ -10,13 +10,15 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/select.h>
+#include <dirent.h>
+#include <errno.h>
 #include <signal.h>
 #include <arpa/inet.h>
 
 extern int h_errno;
 
 // define global constants
-#define PORT 8080
+#define PORT 4000
 #define MAXLINE 1024
 
 // max function declaration
@@ -50,6 +52,12 @@ int main()
         exit(EXIT_FAILURE);
     } 
     else printf("Stream Socket bound.\n");
+    // Now tcp server is ready to listen and verification 
+    if ((listen(tcpsockfd, 5)) != 0) { 
+        printf("Listen failed.\n"); 
+        exit(0);
+    }
+    else printf("TCP Server listening...\n"); 
 
     // Create a UDP server socket
     udpsockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -71,18 +79,20 @@ int main()
     int ready_fd; // stores the descriptor which is ready
     // from man page, nfds should be set to the highest-numbered file descriptor in any of the three sets, plus 1
     int ndfs = max(udpsockfd, tcpsockfd) + 1;
-    FD_ZERO(&read_set);
 
     // looping for accepting connection
     while(1) 
     {
         // using select() within a loop, the  sets  must  be  reinitialized before each call.
-        FD_SET(tcpsockfd, &read_set);
+        FD_ZERO(&read_set);
         FD_SET(udpsockfd, &read_set);
+        FD_SET(tcpsockfd, &read_set);
 
         // wait for either TCP or UDP descriptor to get ready
         ready_fd = select(ndfs, &read_set, NULL, NULL, NULL);
-        
+        // if ready_fd returns a non-valid fd
+        if (ready_fd <= 0) continue;
+
         // get length of client address
         len = sizeof(cliaddr);
 
@@ -144,7 +154,6 @@ int main()
                 }
                 // closing the listening connection in child
                 close(udpsockfd);
-                close(connfd);
                 return 0;
             }
         }
@@ -152,7 +161,129 @@ int main()
         // check if TCP descriptor is set from select
         if (FD_ISSET(tcpsockfd, &read_set))
         {
-            // handle TCP connection
+            // handle TCP connection in a child process
+            int pid = fork();
+            if (pid < 0) 
+            {
+                printf("Failed to create child to handle TCP connection!\n");
+            }
+            else if (pid == 0) 
+            {
+                // handle TCP connection
+                // Accept the data packet from client and verification 
+                connfd = accept(tcpsockfd, (struct sockaddr *)&cliaddr, &len); 
+                if (connfd < 0) { 
+                    printf("TCP server acccept failed...\n"); 
+                    exit(EXIT_FAILURE); 
+                } 
+                else printf("Server has accepted the TCP client...\n");
+
+                int i,j,n, flag;
+                char buffer[MAXLINE];
+                char req_sub_dir[MAXLINE];
+
+                // receive the name of the folder inside images
+                flag=0;
+                i=0;
+                while(1)
+                {
+                    n = recv(connfd, (char *)buffer, MAXLINE, 0);
+                    if(n>0)
+                    {
+                        for(j=0;j<n;j++,i++)
+                        {
+                            // $ is the symbol to terminate on
+                            if(buffer[j]=='$') 
+                            {
+                                req_sub_dir[i]='\0';
+                                flag=1;
+                                break;
+                            }
+                            else req_sub_dir[i] = buffer[j];
+                        }
+                        
+                    }
+                    if(flag==1) break;
+                }
+                printf("requested image sub directory is %s\n", req_sub_dir);
+
+                // create the directory path string
+                char *begin = "images/";
+                char *to_path = malloc (strlen (begin) + strlen (req_sub_dir) + 1);
+                if (to_path == NULL) {
+                    // handle memory failure
+                    printf("ERROR: OUT OF MEMORY!!!\n");
+                    exit(EXIT_FAILURE);
+                }
+                strcpy(to_path, begin);
+                strcat(to_path, req_sub_dir);
+
+                // checking for directory existence in images folder
+                DIR* dir = opendir(to_path);
+                if (dir) {
+                    /* Directory exists. */
+                    char send_buffer[2*MAXLINE];
+                    struct dirent* in_file;
+                    int cur_file, k;
+                    // read each file in the directory
+                    while ((in_file = readdir(dir)))
+                    {
+                        // skipping . and .. files which are for movement 
+                        if (!strcmp (in_file->d_name, "."))
+                            continue;
+                        if (!strcmp (in_file->d_name, ".."))
+                            continue;
+
+                        printf("sending file %s...\n", in_file->d_name);
+
+                        // create full path to the image
+                        // create the directory path string
+                        char *full_img_path = malloc (strlen (to_path) + strlen (in_file->d_name) + 2);
+                        if (full_img_path == NULL) {
+                            // handle memory failure
+                            printf("ERROR: OUT OF MEMORY!!!\n");
+                            exit(EXIT_FAILURE);
+                        }
+                        strcpy(full_img_path, to_path);
+                        strcat(full_img_path, "/");
+                        strcat(full_img_path, in_file->d_name);
+
+                        // open file to send it in packets of length MAXLINE+2
+                        cur_file = open(full_img_path, O_RDONLY);
+                        k=0;
+                        while(1)
+                        {
+                            // set buffer to series of zeros
+                            bzero(send_buffer, sizeof(send_buffer)); 
+                            k = read(cur_file, send_buffer, MAXLINE);
+                            // printf("sending %d bytes\n", k);
+                            // mark end of one image file with EOF
+                            if (k<MAXLINE)
+                            {
+                                send_buffer[k] = 'E';
+                                send_buffer[k+1] = 'O';
+                                send_buffer[k+2] = 'F';
+                                send(connfd, send_buffer, k+3, 0);
+                                printf("file sent!\n");
+                                break;
+                            }
+                            // only send k bytes if not end of file
+                            send(connfd, send_buffer, k, 0);
+                        }
+                    }
+                    // send end message
+                    send(connfd, "END", sizeof("END"), 0);
+                    closedir(dir);
+                } else {
+                    /* Directory does not exist. */
+                    printf("Subdirectory not found.\n");
+                    close(connfd);
+                    exit(EXIT_FAILURE);
+                }
+                close(connfd);
+                close(tcpsockfd);
+                free(to_path);
+            }
         }
     }
 
