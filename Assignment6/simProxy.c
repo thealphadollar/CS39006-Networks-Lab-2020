@@ -75,7 +75,7 @@ void rec_socket(int *sockfdptr)
     return;
 }
 
-void send_socket(int *sockfdptr, struct sockaddr_in *servaddrptr)
+void send_socket(int *sockfdptr, struct sockaddr_in *servaddrptr, int outPORT, char* outaddr)
 {   
     int sockfd; 
     struct sockaddr_in servaddr, myaddr; 
@@ -124,22 +124,92 @@ int max(int a, int b, struct connection * conns, int conn_val)
     return cur_max;
 }
 
+int parse_dest(char* buff, char* destIP, int* port)
+{
+    int flag=0;
+    char cur_word[1000], cur_line[1000];
+    char *end_line;
+    char *cur_line_dyno = strtok_r(buff, "\n", &end_line);
+    while(cur_line!=NULL){
+        strcpy(cur_line, cur_line_dyno);
+        printf("DEBUG: CURLINE: %s\n",cur_line);
+        char *end_word;
+        char *cur_word_dyno = strtok_r(cur_line_dyno, " ", &end_word);
+        printf("DEBUG: CURLINE: %s\n",cur_line);
+        while(cur_word!=NULL){
+            strcpy(cur_word, cur_word_dyno);
+            printf("DEBUG: CURWORD: %s\n",cur_word);
+            if (!flag){
+                flag = 1;
+            }
+            else if (flag){
+                char *end_addr;
+                char *destAddr = strtok_r(cur_word_dyno, ":", &end_addr);
+                printf("DEBUG: CURWORD: %s\n",cur_word);
+                struct hostent *resp;
+                if (strcmp(destAddr, "http") == 0){
+                    *port = 80;
+                    char destAddrBuff[1000];
+                    int a=7, b = strlen(cur_word)-a-1;
+                    printf("%s",cur_word);
+                    strncpy(destAddrBuff, cur_word+a, b);
+                    printf("DEBUG: %s\n", destAddrBuff);
+                    // get IP from DNS
+                    resp = gethostbyname(destAddrBuff);
+                }
+                else if (strcmp(destAddr, "https") == 0){
+                    *port = 443;
+                    char destAddrBuff[1000];
+                    int a=8, b = strlen(cur_word)-a-1;
+                    printf("%s",cur_word);
+                    strncpy(destAddrBuff, cur_word+a, b);
+                    printf("DEBUG: %s\n", destAddrBuff);
+                    // get IP from DNS
+                    resp = gethostbyname(destAddrBuff);
+                }
+                else {
+                    printf("here\n%s");
+                    resp = gethostbyname(destAddr);
+                    *port = atoi(strtok_r(NULL, ":", &end_addr));
+                }
+                // handle successful response
+                if (resp)
+                {
+                    // convert an Internet network address into ASCII string
+                    strcpy(destIP,inet_ntoa(*((struct in_addr*) 
+                           resp->h_addr_list[0])));
+                    printf("DEBUG: %s:%d\n", destIP, *port);
+                }
+                // handle failed response
+                else
+                {
+                    // put the error in herror
+                    herror("gethostbyname");
+                    destIP = destAddr;
+                }
+                break;
+            }
+            cur_word_dyno = strtok_r(NULL, " ", &end_word);
+        }
+        if (flag) break;
+        cur_line_dyno = strtok_r(NULL, "\n", &end_line);
+    }
+}
+
 
 int main(int argc, char **argv)
 {
     // ignore SIGPIPE as some TCP connection clients might become unavailable while sending data
     signal(SIGPIPE, SIG_IGN);
 
-    if (argc<4)
+    if (argc<2)
     {
-        printf("ERROR: Usage `./a.out PORT PROXY_ADDR PROXY_PORT`\n");
+        printf("ERROR: Usage `./a.out PORT`\n");
         exit(EXIT_FAILURE);
     }
     // parsing command line arguments
 	inPORT = atoi(argv[1]);
-	strcpy(outaddr,argv[2]);
-	outPORT = atoi(argv[3]);
-	printf("Proxy running on port %d. Forwarding all connections to %s:%d\n", inPORT, outaddr, outPORT);
+	printf("Proxy running on port %d.\n", inPORT);
     
     // defining variables
     struct sockaddr_in cliaddr, servaddr;
@@ -220,16 +290,6 @@ int main(int argc, char **argv)
             }
             else printf("INFO: Connection accepted from %s:%d\n",inet_ntoa(cliaddr.sin_addr),ntohs(cliaddr.sin_port));
             conns[con_val].client = connfd_cli;
-            // create a tunnel to proxy server
-            send_socket(&sockfd_serv, &servaddr);
-            // make the tunnel non-blocking
-            fcntl(sockfd_serv, F_SETFL, O_NONBLOCK);
-            if (sockfd_serv<0) {
-                printf("ERROR: failed to connect to proxy server!\n");
-                exit(EXIT_FAILURE);
-            }
-            else printf("INFO: Tunnel created to proxy server!\n");
-            conns[con_val].prox_server = sockfd_serv;
             // replace earliest connection with new one
             con_val = (con_val+1)%MAX_CONNECTIONS;
             con_count++;
@@ -264,6 +324,23 @@ int main(int argc, char **argv)
                 if(n>0)
                 {
                     buffer_recv[n]='\0';
+                    // if this is first connection from this client, create connection to destination
+                    printf("DEBUG: FROM_CLIENT: %s",buffer_recv);
+                    if (conns[i].prox_server==-1)
+                    {
+                        parse_dest(buffer_recv, outaddr, &outPORT);
+                        // create a tunnel to proxy server
+                        printf("DEBUG: Tunnel connection to %s:%d\n",outaddr, outPORT);
+                        send_socket(&sockfd_serv, &servaddr, outPORT, outaddr);
+                        // make the tunnel non-blocking
+                        fcntl(sockfd_serv, F_SETFL, O_NONBLOCK);
+                        if (sockfd_serv<0) {
+                            printf("ERROR: failed to connect to %s:%d server!\n", outaddr, outPORT);
+                            exit(EXIT_FAILURE);
+                        }
+                        else printf("INFO: Tunnel created to destination %s:%d\n", outaddr, outPORT);
+                        conns[con_val].prox_server = sockfd_serv;
+                    }
                     // tunnel data to proxy server
                     int l = send(conns[i].prox_server, buffer_recv, n, 0);
                 }
