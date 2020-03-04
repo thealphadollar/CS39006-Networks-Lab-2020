@@ -22,8 +22,10 @@
 int inPORT, outPORT;
 char outaddr[100];
 
+char buff_duplicate[MAX_BUF_SIZE+1];
+
 struct connection {
-    int client, prox_server;
+    int client, prox_server, len_addr;
 };
 
 void rec_socket(int *sockfdptr)
@@ -124,40 +126,76 @@ int max(int a, int b, struct connection * conns, int conn_val)
     return cur_max;
 }
 
-int parse_dest(char* buff, char* destIP, int* port)
+//Function to parse and detect destination server of the HTTP requests
+int parse_dest(char* buff, char* destIP, int* port, int* len_addr, int *https)
 {
     int flag=0;
     char cur_word[1000], cur_line[1000];
     char *end_line;
     char *cur_line_dyno = strtok_r(buff, "\n", &end_line);
+
+    //Iterating through the lines of the HTTP request
+    //All information for determining destination server is present in the first line, 
+    //thus this is the only line that is actually iterated through
     while(cur_line!=NULL){
         strcpy(cur_line, cur_line_dyno);
-        printf("DEBUG: CURLINE: %s\n",cur_line);
+        //printf("DEBUG: CURLINE: %s\n",cur_line);
         char *end_word;
         char *cur_word_dyno = strtok_r(cur_line_dyno, " ", &end_word);
-        printf("DEBUG: CURLINE: %s\n",cur_line);
+        //printf("DEBUG: CURLINE: %s\n",cur_line);
+        
+        //Iterating through the words (space seperated) of the lines
         while(cur_word!=NULL){
             strcpy(cur_word, cur_word_dyno);
-            printf("DEBUG: CURWORD: %s\n",cur_word);
+            //printf("DEBUG: CURWORD: %s\n",cur_word);
+            //Flag stops iteration from more than one line
             if (!flag){
                 flag = 1;
             }
+            //Obtaining the host name and then it's ip address through DNS
+            //If HTTP request, port is assumed to be 80, unless further specified in the requests by the format "host:PORT"
             else if (flag){
                 char *end_addr;
                 char *destAddr = strtok_r(cur_word_dyno, ":", &end_addr);
                 printf("DEBUG: CURWORD: %s\n",cur_word);
                 struct hostent *resp;
                 if (strcmp(destAddr, "http") == 0){
+                    *len_addr = strlen(destAddr)-1;
                     *port = 80;
                     char destAddrBuff[1000];
                     int a=7, b = strlen(cur_word)-a-1;
-                    printf("%s",cur_word);
                     strncpy(destAddrBuff, cur_word+a, b);
-                    printf("DEBUG: %s\n", destAddrBuff);
+                    destAddrBuff[b]='\0';
+
+                    int i, len_buff=strlen(destAddrBuff);
+
+                    printf("DEBUG: Initial destAddrBuff: %s\n", destAddrBuff);
+
+                    int colpos=len_buff;
+                    for (i=0;i<len_buff;i++){
+                        if (destAddrBuff[i]==':'){
+                            destAddrBuff[i] = '\0';
+                            colpos=i;
+                        }
+                        else if(destAddrBuff[i]== '/') {
+                            destAddrBuff[i] = '\0';
+                        }
+                    }
+                    i=colpos;
+                    if (i<len_buff){
+                        *port = atoi(destAddrBuff+i+1);
+                    }
+                    printf("DEBUG: Final destAddrBuff: %s\n", destAddrBuff);
                     // get IP from DNS
                     resp = gethostbyname(destAddrBuff);
                 }
+                //HTTPS requests are not handled
                 else if (strcmp(destAddr, "https") == 0){
+                    //Not handling https
+                    *https=1;
+                    break;
+                    /*
+                    *len_addr = strlen(destAddr)-1;
                     *port = 443;
                     char destAddrBuff[1000];
                     int a=8, b = strlen(cur_word)-a-1;
@@ -166,9 +204,10 @@ int parse_dest(char* buff, char* destIP, int* port)
                     printf("DEBUG: %s\n", destAddrBuff);
                     // get IP from DNS
                     resp = gethostbyname(destAddrBuff);
+                    */
                 }
                 else {
-                    printf("here\n%s");
+                    *len_addr = strlen(destAddr)-1;
                     resp = gethostbyname(destAddr);
                     *port = atoi(strtok_r(NULL, ":", &end_addr));
                 }
@@ -178,7 +217,11 @@ int parse_dest(char* buff, char* destIP, int* port)
                     // convert an Internet network address into ASCII string
                     strcpy(destIP,inet_ntoa(*((struct in_addr*) 
                            resp->h_addr_list[0])));
-                    printf("DEBUG: %s:%d\n", destIP, *port);
+                    //printf("DEBUG: %s:%d\n", destIP, *port);
+                    if(*port==443) {
+                        *https=1;
+                        break;
+                    }
                 }
                 // handle failed response
                 else
@@ -194,6 +237,50 @@ int parse_dest(char* buff, char* destIP, int* port)
         if (flag) break;
         cur_line_dyno = strtok_r(NULL, "\n", &end_line);
     }
+}
+
+//Function to modify the absolute path in the request given by the browser, to relative path when forwarding to server 
+void modify_path(char* buffer_recv)
+{
+    int i=0, start=-1, start2=-1, count=3, len_buff=strlen(buffer_recv);
+    char protocol[5];
+    for(i=0;i<len_buff;++i)
+        if(buffer_recv[i]==' ') break;
+    i++;
+    
+    strncpy(protocol,buffer_recv+i,4);
+    protocol[4]='\0';
+
+    //Request is of two types: starts with "http://" or directly starts with website name
+    //If starts with "http://", It is handled by rewriting the URI portion of buffer from the first '/' 
+    //(it occurs after the host name and port (after authoritative path))
+    if(strcmp(protocol,"http")==0){
+        for (; i<strlen(buffer_recv); i++){
+            if (buffer_recv[i]=='h' && start==-1) start=i;
+            else if (buffer_recv[i]=='/') count--;
+            if (count==0 && start2==-1) start2=i;
+        }
+        for (;start2<len_buff;start++,start2++){
+            buffer_recv[start] = buffer_recv[start2];
+        }
+        buffer_recv[start] ='\0';
+    }
+    //If starts with website name, then the the URI portion of buffer is re written from the first '/' (occurs after website name amd port(authoritative path))
+    else{
+        for(;i<strlen(buffer_recv);++i){
+            if(buffer_recv[i]=='/'){
+                start=i;
+                break;
+            }
+        }
+
+        for(i=0;start<len_buff;i++,start++){
+            buffer_recv[i]=buffer_recv[start];
+        }
+
+        buffer_recv[i]='\0';
+    }
+    
 }
 
 
@@ -310,6 +397,7 @@ int main(int argc, char **argv)
                 if(m>0)
                 {
                     buffer_send[m]='\0';
+                    printf("DEBUG: FROM SERVER: %s\n", buffer_send);
                     // tunnel data to client
                     send(conns[i].client, buffer_send, m, 0);
                 }
@@ -325,10 +413,18 @@ int main(int argc, char **argv)
                 {
                     buffer_recv[n]='\0';
                     // if this is first connection from this client, create connection to destination
-                    printf("DEBUG: FROM_CLIENT: %s",buffer_recv);
+                    printf("\nDEBUG: FROM_CLIENT: %s",buffer_recv);
                     if (conns[i].prox_server==-1)
                     {
-                        parse_dest(buffer_recv, outaddr, &outPORT);
+                        strcpy(buff_duplicate, buffer_recv);
+                        int flag=0;
+                        parse_dest(buff_duplicate, outaddr, &outPORT, &conns[i].len_addr, &flag);
+                        //This means https  (either has https:// or port is 443)
+                        if(flag==1){
+                            printf("NOT HANDLING HTTPS\n");
+                            continue; 
+                        }
+                        
                         // create a tunnel to proxy server
                         printf("DEBUG: Tunnel connection to %s:%d\n",outaddr, outPORT);
                         send_socket(&sockfd_serv, &servaddr, outPORT, outaddr);
@@ -339,10 +435,16 @@ int main(int argc, char **argv)
                             exit(EXIT_FAILURE);
                         }
                         else printf("INFO: Tunnel created to destination %s:%d\n", outaddr, outPORT);
-                        conns[con_val].prox_server = sockfd_serv;
+                        conns[i].prox_server = sockfd_serv;
                     }
+                    
+                    //Modify the path to convert it from absolute to relative
+                    modify_path(buffer_recv);
+
                     // tunnel data to proxy server
+                    printf("\nDEBUG: FROM_CLIENT: %s",buffer_recv);
                     int l = send(conns[i].prox_server, buffer_recv, n, 0);
+                    printf("DEBUG: %d Sent data\n", l);
                 }
             }
         }
