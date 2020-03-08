@@ -17,8 +17,18 @@
 #define MAX_CONNECTIONS 100
 // A buffer size of 100Kb is required for good enough network speed
 #define MAX_BUF_SIZE 100000
+#define SEND_BUF_SIZE 100000
 #define TEMP_BUF_SIZE 100
 
+// timeout for an invalid connection
+#define CONNECT_TIMEOUT 1
+
+// variable and function to handle alarm signal
+int sTimeout;
+static void AlarmHandler(int sig)
+{
+    sTimeout = 1; 
+}
 
 int inPORT, outPORT;
 char outaddr[100];
@@ -26,7 +36,7 @@ char outaddr[100];
 char buff_duplicate[MAX_BUF_SIZE+1];
 
 struct connection {
-    int client, prox_server, len_addr;
+    int client, prox_server, len_addr, isheader;
 };
 
 void rec_socket(int *sockfdptr)
@@ -78,7 +88,7 @@ void rec_socket(int *sockfdptr)
     return;
 }
 
-void send_socket(int *sockfdptr, struct sockaddr_in *servaddrptr, int outPORT, char* outaddr)
+int send_socket(int *sockfdptr, struct sockaddr_in *servaddrptr, int outPORT, char* outaddr)
 {   
     int sockfd; 
     struct sockaddr_in servaddr, myaddr; 
@@ -97,15 +107,31 @@ void send_socket(int *sockfdptr, struct sockaddr_in *servaddrptr, int outPORT, c
     servaddr.sin_addr.s_addr = inet_addr(outaddr); 
     servaddr.sin_port = htons(outPORT); 
   
-    // connect the client socket to server socket 
-    if (connect(sockfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) != 0) { 
-        printf("ERROR: connection with the server failed...\n"); 
-        exit(0); 
-    } 
-    else printf("INFO: connected to the server..\n"); 
-    
     *sockfdptr = sockfd;
     *servaddrptr = servaddr;
+
+    //Set alarm signal to timeout connect call if it takes too long to connect.
+    //For removing http requests that take too long to connect (Caused because internet doesn't support connections unless they go through institute proxy)
+    sTimeout = 0; 
+    // set alarm as timeout time
+    alarm(CONNECT_TIMEOUT); 
+    // connect the client socket to server socket 
+    if (connect(sockfd, (struct sockaddr *) &servaddr, sizeof(servaddr))) {
+        if(sTimeout){
+            printf("ERROR: Connection with server timed out...\n");
+            close(sockfd);
+            return 0;
+        }
+        printf("ERROR: connection with the server failed...\n");  
+        close(sockfd);
+        return 0;
+    } 
+    else {
+        // disable alarm
+        alarm(0);
+        printf("INFO: connected to the server..\n");
+        return 1;
+    }
 }
 
 // return the maximum file descriptor value
@@ -138,16 +164,19 @@ int parse_dest(char* buff, char* destIP, int* port, int* len_addr, int *https)
     //Iterating through the lines of the HTTP request
     //All information for determining destination server is present in the first line, 
     //thus this is the only line that is actually iterated through
-    while(cur_line!=NULL){
-        strcpy(cur_line, cur_line_dyno);
+    while(cur_line_dyno!=NULL){
+        bzero(&cur_line, sizeof(cur_line));
+        strncpy(cur_line, cur_line_dyno, 999);
         //printf("DEBUG: CURLINE: %s\n",cur_line);
         char *end_word;
         char *cur_word_dyno = strtok_r(cur_line_dyno, " ", &end_word);
-        printf("REQUEST: %s\n",cur_line);
+        //This print is also done in path modify function
+        //printf("REQUEST: %s\n",cur_line);
         
         //Iterating through the words (space seperated) of the lines
-        while(cur_word!=NULL){
-            strcpy(cur_word, cur_word_dyno);
+        while(cur_word_dyno!=NULL){
+            bzero(&cur_word, sizeof(cur_word));
+            strncpy(cur_word, cur_word_dyno, 999);
             //printf("DEBUG: CURWORD: %s\n",cur_word);
             //Flag stops iteration from more than one line
             if (!flag){
@@ -195,17 +224,6 @@ int parse_dest(char* buff, char* destIP, int* port, int* len_addr, int *https)
                     //Not handling https
                     *https=1;
                     break;
-                    /*
-                    *len_addr = strlen(destAddr)-1;
-                    *port = 443;
-                    char destAddrBuff[1000];
-                    int a=8, b = strlen(cur_word)-a-1;
-                    printf("%s",cur_word);
-                    strncpy(destAddrBuff, cur_word+a, b);
-                    printf("DEBUG: %s\n", destAddrBuff);
-                    // get IP from DNS
-                    resp = gethostbyname(destAddrBuff);
-                    */
                 }
                 else {
                     *len_addr = strlen(destAddr)-1;
@@ -243,7 +261,18 @@ int parse_dest(char* buff, char* destIP, int* port, int* len_addr, int *https)
 //Function to modify the absolute path in the request given by the browser, to relative path when forwarding to server 
 void modify_path(char* buffer_recv)
 {
+    
     int i=0, start=-1, start2=-1, count=3, len_buff=strlen(buffer_recv);
+    
+    for(i=0;i<len_buff;++i){
+        if(buffer_recv[i]=='\n'){
+            buffer_recv[i]='\0';
+            break;
+        }   
+    }
+    printf("REQUEST: %s\n",buffer_recv);
+    buffer_recv[i]='\n';
+
     char protocol[5];
     for(i=0;i<len_buff;++i)
         if(buffer_recv[i]==' ') break;
@@ -281,11 +310,13 @@ void modify_path(char* buffer_recv)
 
         buffer_recv[i]='\0';
     }
-
-    for(int i=0;i<len_buff;++i) 
-        if(buffer_recv[i]=='\n')
+    
+    for(i=0;i<len_buff;++i){
+        if(buffer_recv[i]=='\n'){
+            buffer_recv[i]='\0';
             break;
-    buffer_recv[i]='\0';
+        }   
+    }
     printf("REQUEST AFTER PATH MODIFICATION: %s\n",buffer_recv);
     buffer_recv[i]='\n';
 }
@@ -295,6 +326,10 @@ int main(int argc, char **argv)
 {
     // ignore SIGPIPE as some TCP connection clients might become unavailable while sending data
     signal(SIGPIPE, SIG_IGN);
+    // use SIGALRM to handle socket timeouts for external connections
+    struct sigaction new_action;
+    new_action.sa_handler = AlarmHandler;
+    sigaction(SIGALRM, &new_action, NULL);
 
     if (argc<2)
     {
@@ -308,7 +343,7 @@ int main(int argc, char **argv)
     // defining variables
     struct sockaddr_in cliaddr, servaddr;
     int sockfd_cli, connfd_cli, sockfd_serv, len_cli_addr = sizeof(cliaddr), n,m, con_val=0, ready_fd, ndfs;
-    char buffer_send[MAX_BUF_SIZE+1], buffer_recv[MAX_BUF_SIZE+1], std_buf[100];
+    char buffer_send[SEND_BUF_SIZE+1], buffer_recv[MAX_BUF_SIZE+1], std_buf[100];
     char temp_send[TEMP_BUF_SIZE+1], temp_recv[TEMP_BUF_SIZE+1]; 
 
     struct connection conns[MAX_CONNECTIONS];
@@ -326,27 +361,32 @@ int main(int argc, char **argv)
     int con_count=0;
     while(1)
     {
-        // using select() within a loop, the  sets  must  be  reinitialized before each call.
-        FD_ZERO(&read_set);
-        // attach reading incoming connection requests
-        FD_SET(sockfd_cli, &read_set);
-        // attach reading incoming stdin
-        FD_SET(0, &read_set);
-        // attach reading data from all connected requests; client and server
-        for(int i=0;i<con_val; i++) {
-            if (conns[i].client>-1)
-            {
-                FD_SET(conns[i].client, &read_set);
+    
+        //Just to make things easier to understand
+        {
+            // using select() within a loop, the  sets  must  be  reinitialized before each call.
+            FD_ZERO(&read_set);
+            // attach reading incoming connection requests
+            FD_SET(sockfd_cli, &read_set);
+            // attach reading incoming stdin
+            FD_SET(0, &read_set);
+            // attach reading data from all connected requests; client and server
+            for(int i=0;i<con_val; i++) {
+                if (conns[i].client>-1)
+                {
+                    FD_SET(conns[i].client, &read_set);
+                }
+                if (conns[i].prox_server>-1) FD_SET(conns[i].prox_server, &read_set);
             }
-            if (conns[i].prox_server>-1) FD_SET(conns[i].prox_server, &read_set);
+
+            // from man page, nfds should be set to the highest-numbered file descriptor in any of the three sets, plus 1
+            int ndfs = max(0, sockfd_cli, conns, con_val) + 1;
+
+            // get ready fd for read and write
+            ready_fd = select(ndfs, &read_set, NULL, NULL, NULL);
+            if (ready_fd<=0) continue;
+
         }
-
-        // from man page, nfds should be set to the highest-numbered file descriptor in any of the three sets, plus 1
-        int ndfs = max(0, sockfd_cli, conns, con_val) + 1;
-
-        // get ready fd for read and write
-        ready_fd = select(ndfs, &read_set, NULL, NULL, NULL);
-        if (ready_fd<=0) continue;
 
         // read stdin
         if (FD_ISSET(0, &read_set))
@@ -386,6 +426,7 @@ int main(int argc, char **argv)
             }
             else printf("INFO: Connection accepted from %s:%d\n",inet_ntoa(cliaddr.sin_addr),ntohs(cliaddr.sin_port));
             conns[con_val].client = connfd_cli;
+            conns[con_val].isheader=0;
             // replace earliest connection with new one
             con_val = (con_val+1)%MAX_CONNECTIONS;
             con_count++;
@@ -396,21 +437,24 @@ int main(int argc, char **argv)
         //iterating through all tunnels and finding if any is sending information
         for(int i=0;i<MAX_CONNECTIONS;i++)
         {
+            
             // read information from proxy server and pass to client
             if (conns[i].client>-1 && FD_ISSET(conns[i].prox_server, &read_set))
             {
                 // clear buffer
                 bzero(&buffer_send, sizeof(buffer_send));
                 // receive data from proxy server
-                m = recv(conns[i].prox_server, buffer_send, MAX_BUF_SIZE, 0);
+                m = recv(conns[i].prox_server, buffer_send, SEND_BUF_SIZE, 0);
                 if(m>0)
                 {
                     buffer_send[m]='\0';
                     //printf("DEBUG: FROM SERVER: %s\n", buffer_send);
+                    //printf("DEBUG: FROM SERVER: SIZE: %d\n", strlen(buffer_send));
                     // tunnel data to client
                     send(conns[i].client, buffer_send, m, 0);
                 }
             }
+            
             // read information from client and pass to proxy server
             if (conns[i].client>-1 && FD_ISSET(conns[i].client, &read_set))
             {
@@ -428,9 +472,19 @@ int main(int argc, char **argv)
                     if(n>0)
                     {
                         temp_recv[n]='\0';
+                        /*int j=0;
+                        for(j=0;j<strlen(temp_recv);++j){
+                            if(temp_recv[j]=='\r' && temp_recv[j+1]=='\n' && temp_recv[j+2]=='\r' && temp_recv[j+3]=='\n'){
+                                //if(conns[i].isheader==0) conns[i].isheader=1;
+                                conns[i].isheader=(conns[i].isheader+1)%3;
+                                printf("HERE\n");
+                            }
+                        }*/
+
                         strncpy(buffer_recv+size, temp_recv, n);
                         size+=n;
                         buffer_recv[size]='\0';
+                        //if(conns[i].isheader>0) break;
                     }
                     else
                     {
@@ -442,45 +496,56 @@ int main(int argc, char **argv)
                         break;
                     }                    
                 }
-
                 // if this is first connection from this client, create connection to destination
                 //printf("\nDEBUG: FROM_CLIENT: %s",buffer_recv);
                 if (conns[i].prox_server==-1)
                 {
-                    strcpy(buff_duplicate, buffer_recv);
+                    strncpy(buff_duplicate, buffer_recv, MAX_BUF_SIZE+1);
                     int flag=0;
                     parse_dest(buff_duplicate, outaddr, &outPORT, &conns[i].len_addr, &flag);
                     //This means https  (either has https:// or port is 443)
                     if(flag==1){
-                        printf("NOT HANDLING HTTPS\n");
+                        printf("WARNING: NOT HANDLING HTTPS\n");
+                        // close client connection
+                        close(conns[i].client);
                         conns[i].client = -1;
                         // continue;
                     }
                     else
                     {
                         // create a tunnel to proxy server
-                        //printf("DEBUG: Tunnel connection to %s:%d\n",outaddr, outPORT);
-                        send_socket(&sockfd_serv, &servaddr, outPORT, outaddr);
-                        // make the tunnel non-blocking
-                        fcntl(sockfd_serv, F_SETFL, O_NONBLOCK);
-                        if (sockfd_serv<0) {
-                            printf("ERROR: failed to connect to %s:%d server!\n", outaddr, outPORT);
-                            exit(EXIT_FAILURE);
+                        printf("DEBUG: Tunnel connection to %s:%d\n",outaddr, outPORT);
+                        // if send_socket successful
+                        if(send_socket(&sockfd_serv, &servaddr, outPORT, outaddr)){
+                            // make the tunnel non-blocking
+                            fcntl(sockfd_serv, F_SETFL, O_NONBLOCK);
+                            if (sockfd_serv<0) {
+                                printf("ERROR: failed to connect to %s:%d server!\n", outaddr, outPORT);
+                                exit(EXIT_FAILURE);
+                            }
+                            else printf("INFO: Tunnel created to destination %s:%d\n", outaddr, outPORT);
+                            conns[i].prox_server = sockfd_serv;
                         }
-                        else printf("INFO: Tunnel created to destination %s:%d\n", outaddr, outPORT);
-                        conns[i].prox_server = sockfd_serv;
+                        // if send_socket timesout
+                        else{
+                            close(conns[i].client);
+                            conns[i].client=-1;
+                            conns[i].prox_server=-1;
+                        }
                     }
                 }
+                
                 if(conns[i].prox_server>-1 && strlen(buffer_recv)>0)
-                {        
+                {
+                    
                     //Modify the path to convert it from absolute to relative
                     modify_path(buffer_recv);
-                    // printf("%d %d\n", i, conns[i].client);
-
+                    
                     // tunnel data to proxy server
                     //printf("\nDEBUG: FROM_CLIENT: %s",buffer_recv);
-                    int l = send(conns[i].prox_server, buffer_recv, n, 0);
-                    //printf("DEBUG: %d Sent data\n", l);
+                    int l = send(conns[i].prox_server, buffer_recv, strlen(buffer_recv), 0);
+                    
+                    //printf("DEBUG: ")
                 }
             }
         }
