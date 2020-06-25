@@ -1,0 +1,80 @@
+String:"What a beautiful day today is!" (30 characters)
+P       Size of string          Transmissions
+0.05        30                      30
+
+0.10        30                      32
+
+0.15        30                      36
+
+0.20        30                      37
+
+0.25        30                      40
+
+0.30        30                      41 
+
+0.35        30                      44
+
+0.40        30                      52 
+
+0.45        30                      52
+
+0.50        30                      58
+
+
+
+All sending messages are a direct memory copy of the structure sendPacket's fields using the memcopy function.
+
+
+struct sendPacket{
+    struct sockaddr_in addr;   destination socket address
+    int type;       APP or ACK
+    int msg_id;         unique id
+    char *msg;      message
+    int size;       size of message
+};
+
+
+//send Buffer maintatined as a circular queue of size 100
+struct sendBuf{
+    int start, end, size;               //start,end,size of circular queue
+    struct sendPacket *buffer[100];         //circular queue of sendpacket pointers
+} sb;
+
+
+
+//Receive packet structure
+struct recvPacket
+{
+    struct sockaddr_in addr;        //source socket address
+    char* msg;                      //message
+    int size;                       //size of message
+};
+
+//reciever Buffer maintatined as a circular queue of size 100
+struct recvBuf{
+    int start, end, size;                   //start,end, size of recv Buffer
+    struct recvPacket *buffer[100];         //circular queue recv buffer of recv packet pointers
+} rb;
+
+
+
+
+//Element of UnackTable
+struct UnAckTableElem{                  
+    struct sendPacket sp;               //sent packet structure
+    time_t t;                           //time of last sending
+    struct UnAckTableElem *next;        //next element in linked list
+};
+
+//UnackTable maintained as a linked list
+struct UnAckTableElem *UnackHead;       //linked list head
+//Max size maintained at 100            //size of linked list
+int Unacksize;
+
+
+
+//Received message id maintaines as a circular queue of message id's
+struct rcvmsgid{
+    int msg_id[100];                //circular queue of unique message ids
+    int start,end,size;             //start, end,size of circular queue
+} rcv_id;
